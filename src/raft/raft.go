@@ -542,13 +542,13 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := len(rf.log)
-	term := rf.currentTerm
-	isLeader := false
-
 	// Your code here (2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	index := len(rf.log)
+	term := rf.currentTerm
+	isLeader := false
 
 	rf.dlog("Start receieved by %v: %v", rf.currentState, command)
 	if !rf.killed() && rf.currentState == Leader {
@@ -655,13 +655,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.newCommitReadyChan = make(chan struct{})
 	rf.applyCh = applyCh
 
-	rf.becomeFollower(1)
-	go rf.commitChanSender(applyCh)
-
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
+	rf.becomeFollower(1)
+	go rf.commitChanSender(applyCh)
 	go rf.ticker()
 
 	return rf
