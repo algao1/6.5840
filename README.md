@@ -2,7 +2,7 @@
 
 ## Random Thoughts
 
-### Lab 2A
+### Lab 2A: leader election (moderate)
 
 Spent about ~4 hours on the second attempt, but definitely took longer the first time around.
 Completed Jan 23 (2024-01-23).
@@ -22,4 +22,9 @@ Completed Jan 23 (2024-01-23).
   - Any replies with term > currentTerm, convert to follower
 - I also found it helpful to write it as an actual state machine and use tick functions
 
-### Lab 2B
+### Lab 2B: log replication (hard)
+
+Goal: Implement log replication.
+
+- "If election timeout elapses without **receiving AppendEntries RPC from current leader** or granting vote to candidate: convert to candidate"
+- If you're using a channel to send updates on when to commit, be careful about being blocked while inside a critical section. Had some issues because of mutexes
