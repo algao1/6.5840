@@ -19,6 +19,7 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -26,6 +27,7 @@ import (
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -123,13 +125,13 @@ func (rf *Raft) GetState() (int, bool) {
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	raftState := w.Bytes()
+	rf.persister.Save(raftState, nil)
 }
 
 // restore previously persisted state.
@@ -138,18 +140,22 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		panic("something happened, could not decode persisted state")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -211,6 +217,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.lastElectionEvent = time.Now()
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
+		rf.persist()
 	}
 	reply.Term = rf.currentTerm
 	rf.dlog("... RequestVote: reply=%+v", *reply)
@@ -226,8 +233,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -279,11 +288,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// - at the end of the entries
 		// - or we found a mismatch somewhere
 		rf.log = append(rf.log[:insertIndex], args.Entries[entryIndex:]...)
+		rf.persist()
 		if args.LeaderCommit > rf.commitIndex {
 			rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 			rf.newCommitReadyChan <- struct{}{}
 		}
 		reply.Success = true
+	} else if args.PrevLogIndex >= len(rf.log) {
+		reply.ConflictIndex = len(rf.log)
+		reply.ConflictTerm = 0
+	} else if args.PrevLogIndex < len(rf.log) {
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		for i, msg := range rf.log {
+			if msg.Term == reply.ConflictTerm {
+				reply.ConflictIndex = i
+				break
+			}
+		}
 	}
 
 	reply.Term = rf.currentTerm
@@ -354,6 +375,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Term:    term,
 			Command: command,
 		})
+		rf.persist()
 	}
 
 	return index, term, isLeader
@@ -371,9 +393,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	close(rf.newCommitReadyChan)
 }
 
 func (rf *Raft) killed() bool {
@@ -389,6 +408,7 @@ func (rf *Raft) becomeFollower(term int) {
 	rf.votedFor = -1
 	rf.lastElectionEvent = time.Now()
 	rf.tickFunc = rf.tickFollower
+	rf.persist()
 }
 
 func (rf *Raft) tickFollower() {
@@ -409,6 +429,7 @@ func (rf *Raft) becomeCandidate() {
 		defer rf.mu.Unlock()
 		rf.candidateRequestVotes()
 	}()
+	rf.persist()
 }
 
 func (rf *Raft) tickCandidate() {
@@ -487,6 +508,7 @@ func (rf *Raft) becomeLeader() {
 		defer rf.mu.Unlock()
 		rf.leaderAppendEntries()
 	}()
+	rf.persist()
 }
 
 func (rf *Raft) tickLeader() {
@@ -556,9 +578,22 @@ func (rf *Raft) leaderAppendEntries() {
 							}
 						}
 					}
-					go func() { rf.newCommitReadyChan <- struct{}{} }()
+					go func() {
+						rf.newCommitReadyChan <- struct{}{}
+					}()
 				} else {
-					rf.nextIndex[peerId]--
+					if reply.ConflictTerm != 0 {
+						for i := len(rf.log) - 1; i > 0; i-- {
+							if rf.log[i].Term == reply.ConflictTerm {
+								rf.nextIndex[peerId] = i + 1
+								return
+							}
+						}
+						rf.nextIndex[peerId] = reply.ConflictIndex
+					} else {
+						rf.nextIndex[peerId] = reply.ConflictIndex
+					}
+					// rf.nextIndex[peerId]--
 				}
 			}
 		}(peerId)
@@ -598,6 +633,7 @@ func (rf *Raft) newCommitChanSender(applyChan chan ApplyMsg) {
 		rf.lastApplied = rf.commitIndex
 		rf.mu.Unlock()
 	}
+	close(rf.newCommitReadyChan)
 }
 
 func (rf *Raft) dlog(format string, args ...any) {
@@ -626,16 +662,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.log = []LogEntry{{Term: 0}}
 	rf.nextIndex = make([]int, len(rf.peers))
-	for i := range rf.nextIndex {
-		rf.nextIndex[i] = len(rf.log)
-	}
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.newCommitReadyChan = make(chan struct{})
-	rf.becomeFollower(1)
 	go rf.newCommitChanSender(applyCh)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	for i := range rf.nextIndex {
+		rf.nextIndex[i] = len(rf.log)
+	}
+	rf.becomeFollower(rf.currentTerm)
 
 	// start ticker goroutine to start elections
 	go rf.ticker()

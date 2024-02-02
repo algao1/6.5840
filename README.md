@@ -2,7 +2,7 @@
 
 ## Random Thoughts
 
-### Lab 2A: leader election (moderate)
+### Lab 3A: leader election (moderate)
 
 Spent about ~4 hours on the second attempt, but definitely took longer the first time around.
 Completed Jan 23 (2024-01-23).
@@ -22,9 +22,18 @@ Completed Jan 23 (2024-01-23).
   - Any replies with term > currentTerm, convert to follower
 - I also found it helpful to write it as an actual state machine and use tick functions
 
-### Lab 2B: log replication (hard)
+### Lab 3B: log replication (hard)
 
 Goal: Implement log replication.
+Spent quite a bit longer than the last one, and found some hairy edge cases.
+Completed Jan 23 (2024-01-23).
 
 - "If election timeout elapses without **receiving AppendEntries RPC from current leader** or granting vote to candidate: convert to candidate"
 - If you're using a channel to send updates on when to commit, be careful about being blocked while inside a critical section. Had some issues because of mutexes
+
+### Lab 3C: persistance (hard)
+
+Goal: Implement persistence and optimizations.
+
+- Needed to make sure that loading from persistence didn't mess with the initialization of state
+- See the [student's guide](https://thesquareplanet.com/blog/students-guide-to-raft/) on how to properly implement the optimization, since the Raft paper is sparse on details
