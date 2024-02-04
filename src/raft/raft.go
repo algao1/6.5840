@@ -33,7 +33,7 @@ import (
 
 const (
 	DEBUG_MODE       = 0
-	HeartbeatTimeout = time.Duration(100) * time.Millisecond
+	HeartbeatTimeout = time.Duration(50) * time.Millisecond
 )
 
 // as each Raft peer becomes aware that successive log entries are
@@ -101,8 +101,10 @@ type Raft struct {
 	matchIndex  []int
 
 	// Internals.
+	snapshot           []byte
 	currentState       RaftState
 	newCommitReadyChan chan struct{}
+	applyCh            chan ApplyMsg
 	lastElectionEvent  time.Time
 	lastHeartbeatEvent time.Time
 	tickFunc           func()
@@ -153,11 +155,12 @@ func (rf *Raft) persist() {
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
 	raftState := w.Bytes()
-	rf.persister.Save(raftState, nil)
+	rf.dlog("saving snapshot (len:%+v)", len(rf.snapshot))
+	rf.persister.Save(raftState, rf.snapshot)
 }
 
 // restore previously persisted state.
-func (rf *Raft) readPersist(data []byte) {
+func (rf *Raft) readPersist(data, snapshot []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -177,6 +180,11 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.log = log
+		rf.commitIndex = log[0].Index
+		rf.lastApplied = log[0].Index
+		rf.snapshot = snapshot
+		rf.dlog("restore success, commitIndex/lastApplied=%d")
+		// fmt.Printf("[%d] restore success, commitIndex/lastApplied=%d\n", rf.me, log[0].Index)
 	}
 }
 
@@ -193,6 +201,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		return
 	}
 
+	rf.snapshot = snapshot
 	rf.log = rf.log[index-lastIncludedIndex:]
 	rf.log[0].Command = nil
 	rf.persist()
@@ -285,7 +294,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.lastElectionEvent = time.Now()
 
-	rf.dlog("AppendEntries: received=%+v from=%d, currentTerm=%d", *args, rf.me, rf.currentTerm)
+	rf.dlog("AppendEntries: received=%+v currentTerm=%d", *args, rf.currentTerm)
 	if args.Term > rf.currentTerm {
 		rf.dlog("... AppendEntries: current term is outdated, becoming follower")
 		rf.becomeFollower(args.Term)
@@ -342,6 +351,63 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.dlog("... AppendEntries: reply=%+v", *reply)
 }
 
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	if rf.killed() {
+		return
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	rf.lastElectionEvent = time.Now()
+
+	rf.dlog("InstallSnapshot: received=%+v, currentTerm=%d", *args, rf.currentTerm)
+	if args.Term > rf.currentTerm {
+		rf.dlog("... InstallSnapshot: current term is outdated, becoming follower")
+		rf.becomeFollower(args.Term)
+	}
+
+	if args.LastIncludedIndex < rf.getNextIndex() &&
+		rf.log[args.LastIncludedIndex-rf.getFirstIndex()].Term == args.LastIncludedTerm {
+		rf.log = rf.log[args.LastIncludedIndex-rf.getFirstIndex():]
+	} else {
+		rf.log = make([]LogEntry, 1)
+	}
+	rf.log[0].Term = args.LastIncludedTerm
+	rf.log[0].Index = args.LastIncludedIndex
+
+	rf.lastApplied = args.LastIncludedIndex
+	rf.commitIndex = args.LastIncludedIndex
+	rf.snapshot = args.Data
+
+	rf.persist()
+
+	rf.applyCh <- ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      args.Data,
+		SnapshotTerm:  args.LastIncludedTerm,
+		SnapshotIndex: args.LastIncludedIndex,
+	}
+}
+
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
 // expects RPC arguments in args.
@@ -376,6 +442,11 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
 }
 
@@ -564,7 +635,26 @@ func (rf *Raft) leaderAppendEntries() {
 			nextIndex := rf.nextIndex[peerId]
 
 			if nextIndex <= lastIncludedIndex {
+				args := InstallSnapshotArgs{
+					Term:              rf.currentTerm,
+					LeaderId:          rf.me,
+					LastIncludedIndex: rf.getFirstIndex(),
+					LastIncludedTerm:  rf.getFirstTerm(),
+					Data:              rf.snapshot,
+				}
+				var reply InstallSnapshotReply
 				rf.mu.Unlock()
+
+				if ok := rf.sendInstallSnapshot(peerId, &args, &reply); ok {
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					if reply.Term > savedCurrentTerm {
+						rf.dlog("... skipping AppendEntries reply since term out of date")
+						rf.becomeFollower(reply.Term)
+					}
+					rf.matchIndex[peerId] = max(rf.matchIndex[peerId], args.LastIncludedIndex)
+					rf.nextIndex[peerId] = rf.matchIndex[peerId] + 1
+				}
 				return
 			}
 
@@ -603,6 +693,7 @@ func (rf *Raft) leaderAppendEntries() {
 				if reply.Success {
 					rf.nextIndex[peerId] = nextIndex + len(entries)
 					rf.matchIndex[peerId] = rf.nextIndex[peerId] - 1
+					savedCommitIndex := rf.commitIndex
 
 					for i := rf.commitIndex + 1; i < rf.getNextIndex(); i++ {
 						if rf.log[i-rf.getFirstIndex()].Term == savedCurrentTerm {
@@ -617,12 +708,15 @@ func (rf *Raft) leaderAppendEntries() {
 							}
 						}
 					}
-					go func() {
-						rf.newCommitReadyChan <- struct{}{}
-					}()
+
+					if rf.commitIndex > savedCommitIndex {
+						go func() {
+							rf.newCommitReadyChan <- struct{}{}
+						}()
+					}
 				} else {
 					if reply.ConflictTerm != 0 {
-						for i := rf.getLastIndex(); i > 0; i-- {
+						for i := rf.getLastIndex(); i > rf.getFirstIndex(); i-- {
 							if rf.log[i-rf.getFirstIndex()].Term == reply.ConflictTerm {
 								rf.nextIndex[peerId] = i + 1
 								return
@@ -682,8 +776,8 @@ func (rf *Raft) newCommitChanSender(applyChan chan ApplyMsg) {
 }
 
 func (rf *Raft) dlog(format string, args ...any) {
-	format = fmt.Sprintf("[%d] ", rf.me) + format + "\n"
 	if DEBUG_MODE > 0 {
+		format = fmt.Sprintf("[%d] ", rf.me) + format + "\n"
 		fmt.Printf(format, args...)
 	}
 }
@@ -709,16 +803,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.newCommitReadyChan = make(chan struct{})
-	go rf.newCommitChanSender(applyCh)
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+	rf.readPersist(persister.ReadRaftState(), persister.ReadSnapshot())
 	for i := range rf.nextIndex {
 		rf.nextIndex[i] = rf.getNextIndex()
 	}
 	rf.becomeFollower(rf.currentTerm)
 
 	// start ticker goroutine to start elections
+	go rf.newCommitChanSender(applyCh)
 	go rf.ticker()
 
 	return rf
