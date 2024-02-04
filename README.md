@@ -37,3 +37,11 @@ Goal: Implement persistence and optimizations.
 
 - Needed to make sure that loading from persistence didn't mess with the initialization of state
 - See the [student's guide](https://thesquareplanet.com/blog/students-guide-to-raft/) on how to properly implement the optimization, since the Raft paper is sparse on details
+
+### Lab 3D: log compaction (hard)
+
+- Definitely the hardest one of them all
+- Needed to find a way to store index/term of previously compacted log, just saved with every entry
+- Need to make sure to properly save and load snapshots
+- Be sure to also update committedIndex and lastApplied when loading from a snapshot
+- Make sure to not block on sending ApplyMsg through applyCh<-, since it'll create a deadlock
