@@ -710,9 +710,7 @@ func (rf *Raft) leaderAppendEntries() {
 					}
 
 					if rf.commitIndex > savedCommitIndex {
-						go func() {
-							rf.newCommitReadyChan <- struct{}{}
-						}()
+						rf.newCommitReadyChan <- struct{}{}
 					}
 				} else {
 					if reply.ConflictTerm != 0 {
