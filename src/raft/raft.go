@@ -660,13 +660,15 @@ func (rf *Raft) leaderAppendEntries() {
 
 			prevLogIndex := nextIndex - 1
 			prevLogTerm := rf.log[prevLogIndex-rf.getFirstIndex()].Term
-			entries := rf.log[nextIndex-rf.getFirstIndex():]
+			copyLog := make([]LogEntry, rf.getLastIndex()+1-nextIndex)
+			copy(copyLog, rf.log[nextIndex-rf.getFirstIndex():])
+
 			args := AppendEntriesArgs{
 				Term:         savedCurrentTerm,
 				LeaderId:     rf.me,
 				PrevLogIndex: prevLogIndex,
 				PrevLogTerm:  prevLogTerm,
-				Entries:      entries,
+				Entries:      copyLog,
 				LeaderCommit: rf.commitIndex,
 			}
 			var reply AppendEntriesReply
@@ -691,7 +693,7 @@ func (rf *Raft) leaderAppendEntries() {
 
 			if reply.Term == savedCurrentTerm {
 				if reply.Success {
-					rf.nextIndex[peerId] = nextIndex + len(entries)
+					rf.nextIndex[peerId] = nextIndex + len(args.Entries)
 					rf.matchIndex[peerId] = rf.nextIndex[peerId] - 1
 					savedCommitIndex := rf.commitIndex
 
