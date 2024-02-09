@@ -45,3 +45,10 @@ Goal: Implement persistence and optimizations.
 - Need to make sure to properly save and load snapshots
 - Be sure to also update committedIndex and lastApplied when loading from a snapshot
 - Make sure to not block on sending ApplyMsg through applyCh<-, since it'll create a deadlock
+
+### Lab 3 Extras
+
+- Changed to send commitReady inside a go channel to avoid deadlocks
+- Changed `rf.nextIndex[peerId] = min(rf.matchIndex[peerId]+1, reply.ConflictIndex)` to use min instead of max, more correct
+- Increased election timeout
+- Trigger an AppendEntries call (almost) immediately after receiving a command from Start()

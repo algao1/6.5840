@@ -33,7 +33,8 @@ import (
 
 const (
 	DEBUG_MODE       = 0
-	HeartbeatTimeout = time.Duration(50) * time.Millisecond
+	HeartbeatTimeout = 100 * time.Millisecond
+	AppendTimeout    = 20 * time.Millisecond
 )
 
 // as each Raft peer becomes aware that successive log entries are
@@ -184,7 +185,6 @@ func (rf *Raft) readPersist(data, snapshot []byte) {
 		rf.lastApplied = log[0].Index
 		rf.snapshot = snapshot
 		rf.dlog("restore success, commitIndex/lastApplied=%d")
-		// fmt.Printf("[%d] restore success, commitIndex/lastApplied=%d\n", rf.me, log[0].Index)
 	}
 }
 
@@ -236,6 +236,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 
 	reply.VoteGranted = false
+	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		return
 	}
@@ -291,10 +292,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 		return
 	}
+	if args.PrevLogIndex < rf.getFirstIndex() {
+		return
+	}
 
 	rf.lastElectionEvent = time.Now()
 
-	rf.dlog("AppendEntries: received=%+v currentTerm=%d", *args, rf.currentTerm)
+	rf.dlog("AppendEntries: received=%+v currentTerm=%d, log=%+v", *args, rf.currentTerm, rf.log)
 	if args.Term > rf.currentTerm {
 		rf.dlog("... AppendEntries: current term is outdated, becoming follower")
 		rf.becomeFollower(args.Term)
@@ -320,7 +324,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			entryIndex++
 		}
 
-		// rf.dlog("insertIndex=%d, entryIndex=%d", insertIndex, entryIndex)
 		rf.dlog("commitIndex=%d, log=%+v", rf.commitIndex, rf.log)
 
 		// We're either
@@ -331,7 +334,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.persist()
 		if args.LeaderCommit > rf.commitIndex {
 			rf.commitIndex = min(args.LeaderCommit, rf.getLastIndex())
-			rf.newCommitReadyChan <- struct{}{}
+			// We send this over a goroutine so we don't block, found this
+			// out the hard way.
+			go func() {
+				rf.newCommitReadyChan <- struct{}{}
+			}()
 		}
 		reply.Success = true
 	} else if args.PrevLogIndex >= rf.getNextIndex() {
@@ -372,8 +379,10 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	defer rf.mu.Unlock()
 
 	reply.Term = rf.currentTerm
-
 	if args.Term < rf.currentTerm {
+		return
+	}
+	if args.LastIncludedIndex < rf.getFirstIndex() || args.LastIncludedIndex < rf.commitIndex {
 		return
 	}
 
@@ -479,6 +488,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Command: command,
 		})
 		rf.persist()
+		// We set a shorter timeout here, so we can increase throughput.
+		// I haven't found a better way to address this, so this will have
+		// to do.
+		rf.lastHeartbeatEvent = time.Now().Add(-HeartbeatTimeout + AppendTimeout)
 	}
 
 	return index, term, isLeader
@@ -525,13 +538,8 @@ func (rf *Raft) becomeCandidate() {
 	rf.currentState = Candidate
 	rf.currentTerm++
 	rf.votedFor = rf.me
-	rf.lastElectionEvent = time.Now()
+	rf.lastElectionEvent = time.Now().Add(-1 * time.Second)
 	rf.tickFunc = rf.tickCandidate
-	go func() {
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
-		rf.candidateRequestVotes()
-	}()
 	rf.persist()
 }
 
@@ -547,6 +555,7 @@ func (rf *Raft) candidateRequestVotes() {
 	rf.lastElectionEvent = time.Now()
 	votesReceived := 1
 
+	rf.dlog("candidate requesting votes, currentTerm=%d", savedCurrentTerm)
 	for peerId := range rf.peers {
 		if peerId == rf.me {
 			continue
@@ -565,7 +574,6 @@ func (rf *Raft) candidateRequestVotes() {
 			}
 			var reply RequestVoteReply
 
-			rf.dlog("candidate requesting votes from=%d, currentTerm=%d", peerId, savedCurrentTerm)
 			if !rf.sendRequestVote(peerId, &args, &reply) {
 				return
 			}
@@ -603,15 +611,8 @@ func (rf *Raft) becomeLeader() {
 		rf.nextIndex[i] = rf.getNextIndex()
 	}
 	rf.matchIndex = make([]int, len(rf.peers))
-
-	rf.lastHeartbeatEvent = time.Now()
+	rf.lastHeartbeatEvent = time.Now().Add(-HeartbeatTimeout)
 	rf.tickFunc = rf.tickLeader
-	go func() {
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
-		rf.leaderAppendEntries()
-	}()
-	rf.persist()
 }
 
 func (rf *Raft) tickLeader() {
@@ -712,19 +713,26 @@ func (rf *Raft) leaderAppendEntries() {
 					}
 
 					if rf.commitIndex > savedCommitIndex {
-						rf.newCommitReadyChan <- struct{}{}
+						// We send this over a goroutine so we don't block, found this
+						// out the hard way.
+						go func() {
+							rf.newCommitReadyChan <- struct{}{}
+						}()
 					}
 				} else {
 					if reply.ConflictTerm != 0 {
 						for i := rf.getLastIndex(); i > rf.getFirstIndex(); i-- {
 							if rf.log[i-rf.getFirstIndex()].Term == reply.ConflictTerm {
+								rf.dlog("setting nextIndex[%d]=%d", peerId, i+1)
 								rf.nextIndex[peerId] = i + 1
 								return
 							}
 						}
-						rf.nextIndex[peerId] = reply.ConflictIndex
+						rf.dlog("setting nextIndex[%d]=%d", peerId, reply.ConflictIndex)
+						rf.nextIndex[peerId] = min(rf.matchIndex[peerId]+1, reply.ConflictIndex)
 					} else {
-						rf.nextIndex[peerId] = reply.ConflictIndex
+						rf.dlog("setting nextIndex[%d]=%d", peerId, reply.ConflictIndex)
+						rf.nextIndex[peerId] = min(rf.matchIndex[peerId]+1, reply.ConflictIndex)
 					}
 				}
 			}
@@ -733,7 +741,7 @@ func (rf *Raft) leaderAppendEntries() {
 }
 
 func (rf *Raft) electionTimeout() time.Duration {
-	ms := 200 + (rand.Int63() % 200)
+	ms := 300 + (rand.Int63() % 300)
 	return time.Duration(ms) * time.Millisecond
 }
 
