@@ -1,28 +1,41 @@
 package kvraft
 
 import (
-	"6.5840/labgob"
-	"6.5840/labrpc"
-	"6.5840/raft"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"6.5840/labgob"
+	"6.5840/labrpc"
+	"6.5840/raft"
 )
 
-const Debug = false
+const (
+	SERVER_DEBUG_MODE = 0
+	TIMEOUT_DURATION  = 1 * time.Second
+	ERR_NOT_LEADER    = Err("not leader")
+	ERR_TIMED_OUT     = Err("request timed out")
+)
 
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug {
+func (kv *KVServer) dlog(format string, a ...interface{}) (n int, err error) {
+	if SERVER_DEBUG_MODE > 0 {
+		format = fmt.Sprintf("[server %d] ", kv.me) + format + "\n"
 		log.Printf(format, a...)
 	}
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Key       string
+	Value     string
+	OpType    string
+	ClientId  int
+	RequestId int
 }
 
 type KVServer struct {
@@ -35,15 +48,97 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	values map[string]string
+	// duplicate table as described below, one table entry per client
+	// https://pdos.csail.mit.edu/6.824/notes/l-raft-QA.txt
+	dupeTable map[int]int
+	handlers  map[int]chan Op
 }
-
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	if kv.killed() {
+		return
+	}
+
+	op := Op{
+		Key:       args.Key,
+		OpType:    "Get",
+		ClientId:  args.ClientId,
+		RequestId: args.RequestId,
+	}
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ERR_NOT_LEADER
+		return
+	}
+
+	kv.mu.Lock()
+	ch := make(chan Op, 1)
+	kv.handlers[index] = ch
+	kv.mu.Unlock()
+
+	kv.dlog("Get operation=%+v blocking on handler, index=%d", args, index)
+	select {
+	case <-ch:
+		_, isLeader = kv.rf.GetState()
+		if !isLeader {
+			reply.Err = ERR_NOT_LEADER
+			return
+		}
+	case <-time.After(TIMEOUT_DURATION):
+		reply.Err = ERR_TIMED_OUT
+		return
+	}
+
+	kv.mu.Lock()
+	reply.Value = kv.values[args.Key]
+	close(ch)
+	delete(kv.handlers, index)
+	kv.mu.Unlock()
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	if kv.killed() {
+		return
+	}
+
+	op := Op{
+		Key:       args.Key,
+		Value:     args.Value,
+		OpType:    args.Op,
+		ClientId:  args.ClientId,
+		RequestId: args.RequestId,
+	}
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ERR_NOT_LEADER
+		return
+	}
+
+	kv.mu.Lock()
+	ch := make(chan Op, 1)
+	kv.handlers[index] = ch
+	kv.mu.Unlock()
+
+	kv.dlog("PutAppend operation=%+v blocking on handler, index=%d", args, index)
+	select {
+	case <-ch:
+		_, isLeader = kv.rf.GetState()
+		if !isLeader {
+			reply.Err = ERR_NOT_LEADER
+			return
+		}
+	case <-time.After(TIMEOUT_DURATION):
+		reply.Err = ERR_TIMED_OUT
+		return
+	}
+
+	kv.mu.Lock()
+	close(ch)
+	delete(kv.handlers, index)
+	kv.mu.Unlock()
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -63,6 +158,49 @@ func (kv *KVServer) Kill() {
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+
+func (kv *KVServer) handleApplyCh() {
+	for !kv.killed() {
+		msg := <-kv.applyCh
+
+		kv.mu.Lock()
+		if msg.CommandValid {
+			op := msg.Command.(Op)
+			kv.dlog("handling op=%+v", op)
+
+			// Here, we only apply the operation if we have not previously
+			// applied it (and thus recorded it in the dupeTable). We still
+			// send it over the appropriate handler, because of the following
+			// scenario:
+
+			// SERVER_1 receives the request, but doesn't process it in time
+			// due to re-elections or failures.
+			// SERVER_2 also receives the request, but the first one is applied
+			// first. If we don't respond, then we'll never make progress with
+			// this request.
+
+			if requestId, ok := kv.dupeTable[op.ClientId]; !ok || op.RequestId > requestId {
+				kv.dupeTable[op.ClientId] = op.RequestId
+				if op.OpType == "Put" {
+					kv.values[op.Key] = op.Value
+				} else if op.OpType == "Append" {
+					kv.values[op.Key] = kv.values[op.Key] + op.Value
+				}
+			}
+
+			handler, ok := kv.handlers[msg.CommandIndex]
+			if !ok {
+				kv.dlog("No handlers found, index=%d", msg.CommandIndex)
+				kv.mu.Unlock()
+				continue
+			}
+			kv.mu.Unlock()
+
+			handler <- op
+			kv.dlog("Sent over handler, index=%d", msg.CommandIndex)
+		}
+	}
 }
 
 // servers[] contains the ports of the set of
@@ -87,11 +225,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
+	kv.values = make(map[string]string)
+	kv.handlers = make(map[int]chan Op)
+	kv.dupeTable = make(map[int]int)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	go kv.handleApplyCh()
 
 	return kv
 }
