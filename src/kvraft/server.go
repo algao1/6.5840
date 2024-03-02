@@ -1,6 +1,8 @@
 package kvraft
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"log"
 	"sync"
@@ -15,8 +17,6 @@ import (
 const (
 	SERVER_DEBUG_MODE = 0
 	TIMEOUT_DURATION  = 1 * time.Second
-	ERR_NOT_LEADER    = Err("not leader")
-	ERR_TIMED_OUT     = Err("request timed out")
 )
 
 func (kv *KVServer) dlog(format string, a ...interface{}) (n int, err error) {
@@ -38,6 +38,11 @@ type Op struct {
 	RequestId int
 }
 
+type KVState struct {
+	Values    map[string]string
+	DupeTable map[int]int
+}
+
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -45,6 +50,7 @@ type KVServer struct {
 	applyCh chan raft.ApplyMsg
 	dead    int32 // set by Kill()
 
+	persister    *raft.Persister
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
@@ -69,7 +75,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
-		reply.Err = ERR_NOT_LEADER
+		reply.Err = ErrWrongLeader
 		return
 	}
 
@@ -83,11 +89,11 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	case <-ch:
 		_, isLeader = kv.rf.GetState()
 		if !isLeader {
-			reply.Err = ERR_NOT_LEADER
+			reply.Err = ErrWrongLeader
 			return
 		}
 	case <-time.After(TIMEOUT_DURATION):
-		reply.Err = ERR_TIMED_OUT
+		reply.Err = ErrTimedOut
 		return
 	}
 
@@ -113,7 +119,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
-		reply.Err = ERR_NOT_LEADER
+		reply.Err = ErrWrongLeader
 		return
 	}
 
@@ -127,11 +133,11 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	case <-ch:
 		_, isLeader = kv.rf.GetState()
 		if !isLeader {
-			reply.Err = ERR_NOT_LEADER
+			reply.Err = ErrWrongLeader
 			return
 		}
 	case <-time.After(TIMEOUT_DURATION):
-		reply.Err = ERR_TIMED_OUT
+		reply.Err = ErrTimedOut
 		return
 	}
 
@@ -189,6 +195,20 @@ func (kv *KVServer) handleApplyCh() {
 				}
 			}
 
+			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() > kv.maxraftstate {
+				kvState := KVState{
+					Values:    kv.values,
+					DupeTable: kv.dupeTable,
+				}
+
+				var buf bytes.Buffer
+				err := gob.NewEncoder(&buf).Encode(kvState)
+				if err != nil {
+					panic("something went wrong, unable to encode values")
+				}
+				kv.rf.Snapshot(msg.CommandIndex, buf.Bytes())
+			}
+
 			handler, ok := kv.handlers[msg.CommandIndex]
 			if !ok {
 				kv.dlog("No handlers found, index=%d", msg.CommandIndex)
@@ -199,8 +219,22 @@ func (kv *KVServer) handleApplyCh() {
 
 			handler <- op
 			kv.dlog("Sent over handler, index=%d", msg.CommandIndex)
+		} else if msg.SnapshotValid {
+			// This is necessary, since we'll send snapshots to nodes that need to catchup.
+			kv.persistFromSnapshot(msg.Snapshot)
+			kv.mu.Unlock()
 		}
 	}
+}
+
+func (kv *KVServer) persistFromSnapshot(snapshot []byte) {
+	var kvState KVState
+	err := gob.NewDecoder(bytes.NewBuffer(snapshot)).Decode(&kvState)
+	if err != nil {
+		panic("something went wrong, unable to decode values")
+	}
+	kv.values = kvState.Values
+	kv.dupeTable = kvState.DupeTable
 }
 
 // servers[] contains the ports of the set of
@@ -222,6 +256,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv := new(KVServer)
 	kv.me = me
+	kv.persister = persister
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
@@ -231,6 +266,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+
+	snapshot := persister.ReadSnapshot()
+	if len(snapshot) > 0 {
+		kv.persistFromSnapshot(snapshot)
+	}
 
 	// You may need initialization code here.
 	go kv.handleApplyCh()
